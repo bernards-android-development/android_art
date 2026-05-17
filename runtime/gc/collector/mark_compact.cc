@@ -323,12 +323,15 @@ bool ShouldUseGenerationalGC() {
 }
 // Inter-Processor Interrupts (IPI), which are used for TLB flush, are very slow on
 // virtual devices, like cuttlefish. Therefore, we don't use MOVE ioctl on such devices.
+static const bool gForceMoveIoctl = GetBoolProperty("dalvik.vm.force_uffd_move", false);
 static const bool gMoveIoctlRequested =
-    com::android::art::rw::flags::use_uffd_move_ioctl_cmc_gc() &&
+    (com::android::art::rw::flags::use_uffd_move_ioctl_cmc_gc() &&
     android::base::GetProperty("ro.hardware.virtual_device", "") != "1" &&
-    GetBoolProperty("persist.device_config.runtime_native_boot.use_uffd_move_ioctl", true);
+    GetBoolProperty("persist.device_config.runtime_native_boot.use_uffd_move_ioctl", true)) 
+    || gForceMoveIoctl;
 #else
 bool ShouldUseGenerationalGC() { return true; }
+static const bool gForceMoveIoctl = false;
 static const bool gMoveIoctlRequested = true;
 #endif
 
@@ -1088,7 +1091,9 @@ bool MarkCompact::MoveIoctlKernelCheck() {
 
   if ((gUffdFeatures & UFFD_FEATURE_MOVE) != 0 && gMoveIoctlRequested) {
     // MOVE ioctl isn't available before 6.1 even on target devices.
-    DCHECK(IsKernelVersionAtLeast(6, 1));
+    if (!gForceMoveIoctl)
+      DCHECK(IsKernelVersionAtLeast(6, 1));
+    
     static bool safe_to_use_move = [&]() {
       // Handle the case of no lts in the release by initializing to 0.
       int major, minor, lts = 0;
@@ -1097,37 +1102,42 @@ bool MarkCompact::MoveIoctlKernelCheck() {
       DCHECK_EQ(ret, 0);
       DCHECK_EQ(strcmp(uts.sysname, "Linux"), 0);
       ret = sscanf(uts.release, "%d.%d.%d:", &major, &minor, &lts);
-      CHECK_GE(ret, 2);
-      CHECK_GE(major, 6);
-      if (kIsTargetAndroid) {
-        if (std::make_pair(major, minor) <= std::make_pair(6, 6)) {
-          // Special mode added in 6.1 and 6.6 kernels to confirm that MOVE
-          // ioctl bug-fixes are in the kernel. On these kernels on devices, the
-          // ioctl should succeed with this additional mode. If it fails then we
-          // don't use MOVE ioctl (See: https://r.android.com/3533441 and
-          // https://r.android.com/413428616).
-          size_t bit_shift;
-          switch (minor) {
-            case 1:
-              bit_shift = 62;
-              break;
-            case 6:
-              bit_shift = 63;
-              break;
-            default:
-              UNREACHABLE();
-          }
-          bool success = move_ioctl(1ull << bit_shift);
-          if (!success) {
-            // The ioctl should fail only because the kernel doesn't have the
-            // bug-fixes and therefore the additional mode is not recognized.
-            CHECK_EQ(errno, EINVAL);
-          }
-          return success;
-        }
-        return true;
+
+      if (gForceMoveIoctl) {
+        return kIsTargetAndroid;
       } else {
-        return major > 6 || minor > 13 || (minor == 13 && lts > 7) || (minor == 12 && lts > 19);
+        CHECK_GE(ret, 2);
+        CHECK_GE(major, 6);
+        if (kIsTargetAndroid) {
+          if (std::make_pair(major, minor) <= std::make_pair(6, 6)) {
+            // Special mode added in 6.1 and 6.6 kernels to confirm that MOVE
+            // ioctl bug-fixes are in the kernel. On these kernels on devices, the
+            // ioctl should succeed with this additional mode. If it fails then we
+            // don't use MOVE ioctl (See: https://r.android.com/3533441 and
+            // https://r.android.com/413428616).
+            size_t bit_shift;
+            switch (minor) {
+              case 1:
+                bit_shift = 62;
+                break;
+              case 6:
+                bit_shift = 63;
+                break;
+              default:
+                UNREACHABLE();
+            }
+            bool success = move_ioctl(1ull << bit_shift);
+            if (!success) {
+              // The ioctl should fail only because the kernel doesn't have the
+              // bug-fixes and therefore the additional mode is not recognized.
+              CHECK_EQ(errno, EINVAL);
+            }
+            return success;
+          }
+          return true;
+        } else {
+          return major > 6 || minor > 13 || (minor == 13 && lts > 7) || (minor == 12 && lts > 19);
+        }
       }
     }();
 
